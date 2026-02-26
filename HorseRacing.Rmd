@@ -1,5 +1,5 @@
 ---
-title: "SmartOdds Junior Quant Test — Horse Racing (Revised)"
+title: "Horse Racing - Sport Betting Modelling"
 author: "Xihang Chen"
 date: today
 format:
@@ -17,7 +17,7 @@ execute:
 params:
   seed: 42
   edge_threshold: 0.05
-  data_path: "input/test_dataset.csv"
+  data_path: "input/horse_racing_dataset.csv"
 ---
 
 ## Set up
