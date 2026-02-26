@@ -1,0 +1,725 @@
+---
+title: "SmartOdds Junior Quant Test — Horse Racing (Revised)"
+author: "Xihang Chen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+params:
+  seed: 42
+  edge_threshold: 0.05
+  data_path: "input/test_dataset.csv"
+---
+
+## Set up
+
+```{r}
+set.seed(params$seed)
+
+library(dplyr)
+library(readr)
+library(here)
+library(lubridate)
+library(tibble)
+library(ggplot2)
+library(splines)
+library(glmnet)
+library(broom)
+
+df <- readr::read_csv(params$data_path, show_col_types = FALSE)
+```
+
+## Q0. Explore the Dataset
+
+I begin with a quick structural check of the data, missingness patterns, and some basic distributions relevant to horse racing (age, carried weight, field size). I also keep an eye on variables that could cause **data leakage** (post-race outcomes, ratings that wouldn’t be known pre-race, etc.) for later modelling.
+
+```{r}
+# Brief overview 
+df |> 
+  dplyr::glimpse()
+```
+
+### Missingness
+
+```{r}
+# Proportion of missing values for each variable
+missings <- df |>
+  dplyr::summarise(across(everything(), ~ mean(is.na(.)))) |>
+  t() |>
+  as.data.frame() |>
+  tibble::rownames_to_column(var = "variable") |>
+  dplyr::rename("missing_prop" = "V1") |>
+  dplyr::filter(.data$missing_prop > 0) |>
+  dplyr::arrange(desc(.data$missing_prop))
+
+missings
+```
+
+Several columns have non-trivial missingness, notably `obs__completion_time`, `obs__racing_post_rating`, and `ltp_5min`.
+
+```{r}
+# Inspect rows with missing completion time
+df |> 
+  dplyr::filter(is.na(.data$obs__completion_time)) |>
+  dplyr::count(obs__Place)
+```
+
+Rows with missing `obs__completion_time` are concentrated in non-completions such as UR (unseated rider), PU (pulled up), BD (brought down), etc. Missing `obs__racing_post_rating` shows a similar pattern. So these variables are **not missing completely at random**: their missingness is related to the race outcome (censoring due to non-completion).
+
+```{r}
+# Missingness of ltp_5min at race level
+df |> 
+  dplyr::filter(is.na(.data$ltp_5min)) |>
+  dplyr::group_by(.data$race_id) |> 
+  dplyr::tally() |>
+  dplyr::rename("n_missing" = "n") |>
+  dplyr::left_join(
+    df |>
+      dplyr::group_by(.data$race_id) |>
+      dplyr::tally() |>
+      dplyr::rename("n_total" = "n"),
+    by = "race_id"
+  ) |>
+  dplyr::mutate(
+    all_missing = (.data$n_missing == .data$n_total)
+  ) |>
+  dplyr::count(all_missing)
+```
+
+For `ltp_5min`, when it is missing it is often missing for all runners in that race (e.g., markets without this data feed). Again, missingness is **race-specific**, not random at runner level.
+
+### Basic distributions
+
+```{r}
+df |>
+  ggplot(aes(x = age)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of Horse Age", x = "Age (years)", y = "Count")
+```
+
+Horse age is right-skewed: many horses are in mid-career, with fewer very young and very old runners.
+
+```{r}
+df |>
+  ggplot(aes(x = carried_weight)) +
+  geom_histogram() +
+  labs(title = "Distribution of Carried Weight", x = "Carried weight", y = "Count")
+```
+
+Carried weight is somewhat bimodal, reflecting different race types and classes.
+
+```{r}
+df |>
+  ggplot(aes(x = n_runners)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Field Size Distribution", x = "Number of runners", y = "Count")
+```
+
+Field sizes vary widely, which will be relevant for baseline win probabilities (1 / n_runners) and for how draw and race dynamics might work.
+
+Overall, the dataset combines **race-level** characteristics (type, going, distance, course), **runner-level** characteristics (age, weight, draw), and **outcome/post-race** variables (RPR, BSP, completion time).
+
+---
+
+## Q1. Explore Peak Age
+
+The goal is to understand whether horses in a given race type have a “peak age”. A naive approach would average performance by age, but this is prone to:
+
+- **Survivorship bias**: poor horses retire earlier; older horses are a selected high-ability group.
+- **Censoring bias**: horses stop racing for health or form reasons.
+- **Simpson’s paradox**: age is confounded with race class, distance, and going; older horses may run in systematically different races.
+
+To mitigate this, I model **Racing Post Rating (`obs__racing_post_rating`) as a function of age**, while controlling for some key race characteristics. I treat RPR as an “absolute” performance measure rather than using market odds.
+
+First, I restrict to runners with a valid RPR and reasonable ages.
+
+```{r}
+q1_df <- df |>
+  dplyr::filter(
+    !is.na(obs__racing_post_rating),
+    !is.na(age),
+    age >= 2,    # filter out extreme outliers if any
+    age <= 15
+  )
+```
+
+For each simplified race type, I fit a linear model with **splines in age and distance**, plus going:
+
+\[
+	ext{RPR} \sim f(	ext{age}) + 	ext{race\_type\_simple} + g(	ext{race\_distance}) + 	ext{going\_clean}.
+\]
+
+```{r}
+model_q1 <- lm(
+  obs__racing_post_rating ~ 
+    race_type_simple +
+    ns(age, df = 4) +
+    ns(race_distance, df = 3) +
+    going_clean,
+  data = q1_df
+)
+
+summary(model_q1)
+```
+
+To estimate “peak age” by race type, I predict RPR on a grid of ages, holding other variables at typical values (median distance, most common going).
+
+```{r}
+# Typical values for covariates
+typical_distance <- median(q1_df$race_distance, na.rm = TRUE)
+typical_going    <- q1_df$going_clean |> na.omit() |> as.character() |> 
+  sort() |> table() |> which.max() |> names()
+
+age_grid <- seq(2, 15, by = 0.1)
+
+newdata_q1 <- expand.grid(
+  age = age_grid,
+  race_type_simple = unique(q1_df$race_type_simple),
+  race_distance = typical_distance,
+  going_clean = typical_going
+)
+
+newdata_q1$pred_rpr <- predict(model_q1, newdata = newdata_q1)
+```
+
+Now I find, for each `race_type_simple`, the age at which predicted RPR is maximised.
+
+```{r}
+peak_age_by_type <- newdata_q1 |>
+  group_by(race_type_simple) |>
+  summarise(
+    peak_age = age[which.max(pred_rpr)],
+    peak_rpr = max(pred_rpr),
+    .groups = "drop"
+  )
+
+peak_age_by_type
+```
+
+We can also visualise the age effect:
+
+```{r}
+newdata_q1 |>
+  ggplot(aes(x = age, y = pred_rpr, colour = race_type_simple)) +
+  geom_line() +
+  labs(
+    title = "Predicted RPR vs Age by Race Type (controlling for distance & going)",
+    x = "Age (years)",
+    y = "Predicted RPR"
+  )
+```
+
+**Summary (Q1):**
+
+- I use **RPR** rather than market odds as the performance measure, which avoids treating odds (a relative, field-dependent quantity) as intrinsic ability.
+- By modelling RPR against age while controlling for distance and going, I reduce the impact of **survivorship bias** and **Simpson’s paradox** compared with raw age averages.
+- The estimated peak ages by race type are given in `peak_age_by_type`. Typically, Flat races peak at younger ages, while Chases and Hurdles peak later.
+
+---
+
+## Q2. Ratings for Horses, Jockeys and Trainers
+
+Here I construct **shrinkage-based ratings** using historical RPRs, ensuring that:
+
+- ratings use only information available **prior** to each race (no look-ahead),
+- small sample sizes are shrunk towards a **global mean**, and
+- I produce **top X tables** for horses, jockeys, and trainers as requested.
+
+### Global mean RPR and shrinkage parameters
+
+```{r}
+df <- df |>
+  dplyr::arrange(date, race_time, race_id)
+
+global_mean_rating <- df |>
+  dplyr::summarise(
+    global_mean = mean(.data$obs__racing_post_rating, na.rm = TRUE)
+  ) |>
+  dplyr::pull("global_mean")
+
+global_mean_rating
+```
+
+I choose data-driven shrinkage parameters based on typical numbers of races per entity.
+
+```{r}
+summarise_runs <- function(data, id_var) {
+  data |>
+    dplyr::count({{ id_var }}, name = "n_races") |>
+    dplyr::summarise(mean_n = mean(n_races), .groups = "drop")
+}
+
+horse_mean_n   <- summarise_runs(df, horse_id)$mean_n
+jockey_mean_n  <- summarise_runs(df, jockey_id)$mean_n
+trainer_mean_n <- summarise_runs(df, trainer_id)$mean_n
+
+k_horse   <- round(horse_mean_n  / 2)   # more races per horse needed before trusting fully
+k_jockey  <- round(jockey_mean_n / 10)
+k_trainer <- round(trainer_mean_n / 10)
+
+c(k_horse = k_horse, k_jockey = k_jockey, k_trainer = k_trainer)
+```
+
+### Horse ratings (shrinkage on historical RPR)
+
+```{r}
+df <- df |>
+  dplyr::group_by(.data$horse_id) |>
+  dplyr::arrange(.data$date, .data$race_time, .data$race_id, .by_group = TRUE) |>
+  dplyr::mutate(
+    rating_valid    = .data$obs__racing_post_rating,
+    cum_sum_rating  = cumsum(dplyr::if_else(is.na(.data$rating_valid), 0, .data$rating_valid)),
+    cum_n_rating    = cumsum(!is.na(.data$rating_valid)),
+    prior_sum       = dplyr::lag(.data$cum_sum_rating, default = 0),
+    prior_n         = dplyr::lag(.data$cum_n_rating,   default = 0),
+    horse_mean_prior = dplyr::if_else(
+      .data$prior_n > 0,
+      .data$prior_sum / .data$prior_n,
+      NA_real_
+    ),
+    horse_weight = .data$prior_n / (.data$prior_n + k_horse),
+    rating_horse = dplyr::case_when(
+      .data$prior_n == 0 ~ global_mean_rating,
+      TRUE ~ .data$horse_weight * .data$horse_mean_prior +
+        (1 - .data$horse_weight) * global_mean_rating
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    -dplyr::all_of(c("rating_valid", "cum_sum_rating", "cum_n_rating",
+                     "prior_sum", "prior_n", "horse_weight", "horse_mean_prior"))
+  )
+
+df |>
+  dplyr::select(race_id, horse_id, rating_horse) |>
+  head()
+```
+
+### Jockey ratings
+
+```{r}
+df <- df |>
+  dplyr::group_by(.data$jockey_id) |>
+  dplyr::arrange(.data$date, .data$race_time, .data$race_id, .by_group = TRUE) |>
+  dplyr::mutate(
+    rating_valid     = .data$obs__racing_post_rating,
+    cum_sum_rating   = cumsum(dplyr::if_else(is.na(.data$rating_valid), 0, .data$rating_valid)),
+    cum_n_rating     = cumsum(!is.na(.data$rating_valid)),
+    prior_sum        = dplyr::lag(.data$cum_sum_rating, default = 0),
+    prior_n          = dplyr::lag(.data$cum_n_rating,   default = 0),
+    jockey_mean_prior = dplyr::if_else(
+      .data$prior_n > 0,
+      .data$prior_sum / .data$prior_n,
+      NA_real_
+    ),
+    jockey_weight = .data$prior_n / (.data$prior_n + k_jockey),
+    rating_jockey = dplyr::case_when(
+      .data$prior_n == 0 ~ global_mean_rating,
+      TRUE ~ .data$jockey_weight * .data$jockey_mean_prior +
+        (1 - .data$jockey_weight) * global_mean_rating
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    -dplyr::all_of(c("rating_valid", "cum_sum_rating", "cum_n_rating",
+                     "prior_sum", "prior_n", "jockey_weight", "jockey_mean_prior"))
+  )
+
+df |>
+  dplyr::select(race_id, horse_id, rating_horse, rating_jockey) |>
+  head()
+```
+
+### Trainer ratings
+
+```{r}
+df <- df |>
+  dplyr::group_by(.data$trainer_id) |>
+  dplyr::arrange(.data$date, .data$race_time, .data$race_id, .by_group = TRUE) |>
+  dplyr::mutate(
+    rating_valid       = .data$obs__racing_post_rating,
+    cum_sum_rating     = cumsum(dplyr::if_else(is.na(.data$rating_valid), 0, .data$rating_valid)),
+    cum_n_rating       = cumsum(!is.na(.data$rating_valid)),
+    prior_sum          = dplyr::lag(.data$cum_sum_rating, default = 0),
+    prior_n            = dplyr::lag(.data$cum_n_rating,   default = 0),
+    trainer_mean_prior = dplyr::if_else(
+      .data$prior_n > 0,
+      .data$prior_sum / .data$prior_n,
+      NA_real_
+    ),
+    trainer_weight = .data$prior_n / (.data$prior_n + k_trainer),
+    rating_trainer = dplyr::case_when(
+      .data$prior_n == 0 ~ global_mean_rating,
+      TRUE ~ .data$trainer_weight * .data$trainer_mean_prior +
+        (1 - .data$trainer_weight) * global_mean_rating
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    -dplyr::all_of(c("rating_valid", "cum_sum_rating", "cum_n_rating",
+                     "prior_sum", "prior_n", "trainer_weight", "trainer_mean_prior"))
+  )
+
+df |>
+  dplyr::select(race_id, horse_id, rating_horse, rating_jockey, rating_trainer) |>
+  head()
+```
+
+### Top X horse / jockey / trainer tables
+
+To make the ratings more interpretable, I aggregate them into **top lists** with a minimum number of runs.
+
+```{r}
+# Helper to get top entities
+top_entities <- function(data, id_var, rating_var, min_runs = 5, top_n = 20) {
+  data |>
+    dplyr::group_by({{ id_var }}) |>
+    dplyr::summarise(
+      mean_rating = mean({{ rating_var }}, na.rm = TRUE),
+      n_runs      = dplyr::n(),
+      .groups     = "drop"
+    ) |>
+    dplyr::filter(n_runs >= min_runs) |>
+    dplyr::arrange(desc(mean_rating)) |>
+    dplyr::slice_head(n = top_n)
+}
+
+top_horses <- top_entities(df, horse_id, rating_horse, min_runs = 5, top_n = 20)
+top_jockeys <- top_entities(df, jockey_id, rating_jockey, min_runs = 20, top_n = 20)
+top_trainers <- top_entities(df, trainer_id, rating_trainer, min_runs = 20, top_n = 20)
+
+top_horses
+top_jockeys
+top_trainers
+```
+
+**Summary (Q2):**
+
+- I use RPR-based, shrinkage-adjusted ratings for horses, jockeys, and trainers, avoiding overfitting to small sample sizes.
+- Ratings are **forward-looking**: they only use past runs up to each race.
+- I provide **top X tables** for horses, jockeys, and trainers with minimum run thresholds, which highlight consistently strong performers.
+- A natural extension would be to add **time decay** (down-weighting older runs) or race-type-specific ratings.
+
+---
+
+## Q3. Build a Predictive Model
+
+I now model the probability that a runner wins. The key considerations are:
+
+- Maintain **race-level structure** (only one winner per race).
+- Use the ratings from Q2 plus sensible covariates.
+- Report **feature importance** and performance.
+
+### Train–test split by race
+
+To avoid leakage between horses in the same race, I split by **race_id** (70% of races in training, 30% in test), ordered chronologically.
+
+```{r}
+race_order <- df |>
+  dplyr::distinct(.data$race_id, .data$date, .data$race_time) |>
+  dplyr::arrange(date, race_time, race_id) |>
+  dplyr::mutate(race_index = dplyr::row_number())
+
+n_races <- nrow(race_order)
+train_cutoff <- floor(0.7 * n_races)
+
+train_races <- race_order |>
+  dplyr::filter(.data$race_index <= train_cutoff) |>
+  dplyr::pull("race_id")
+
+df <- df |>
+  dplyr::mutate(
+    set = dplyr::if_else(.data$race_id %in% train_races, "train", "test")
+  )
+
+df |>
+  dplyr::count(set)
+```
+
+### Model specification
+
+I focus on a **logistic regression with spline terms** for some continuous variables. The response is `obs__is_winner` (1 if winner, 0 otherwise). Predictors include:
+
+- Ratings: `rating_horse`, `rating_jockey`, `rating_trainer`
+- Runner attributes: `age`, `carried_weight`, `draw`
+- Race characteristics: `race_distance`, `race_type_simple`, `going_clean`, `n_runners`, `racecourse_country`
+
+```{r}
+train_df <- df |>
+  dplyr::filter(
+    set == "train",
+    !is.na(obs__is_winner),
+    !is.na(rating_horse),
+    !is.na(rating_jockey),
+    !is.na(rating_trainer)
+  )
+
+test_df_raw <- df |>
+  dplyr::filter(
+    set == "test",
+    !is.na(obs__is_winner),
+    !is.na(rating_horse),
+    !is.na(rating_jockey),
+    !is.na(rating_trainer)
+  )
+
+# Final logistic model with splines
+win_model_ns <- glm(
+  obs__is_winner ~
+    rating_horse + rating_jockey + rating_trainer +
+    age +
+    ns(carried_weight, df = 3) +
+    ns(race_distance, df = 3) +
+    ns(draw, df = 3) +
+    race_type_simple + going_clean +
+    n_runners + racecourse_country,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+
+summary(win_model_ns)
+```
+
+### Race-wise probabilities via softmax on linear predictor
+
+A pure runner-level logistic model ignores the constraint that **exactly one horse wins each race**. To partially address this, I transform the **linear predictor** into race-wise probabilities using a softmax:
+
+\[
+p_{i,r} = rac{\exp(\eta_{i,r})}{\sum_{j \in r} \exp(\eta_{j,r})},
+\]
+
+where \(\eta_{i,r}\) is the linear predictor for runner \(i\) in race \(r\). This enforces that probabilities per race sum to 1.
+
+```{r}
+# Compute race-wise probabilities for the test set
+test_df <- test_df_raw |>
+  dplyr::mutate(
+    lp = predict(win_model_ns, newdata = ., type = "link")
+  ) |>
+  dplyr::group_by(race_id) |>
+  dplyr::mutate(
+    # numerical stabilisation with subtract max
+    exp_lp = exp(lp - max(lp, na.rm = TRUE)),
+    winning_prob = exp_lp / sum(exp_lp, na.rm = TRUE)
+  ) |>
+  dplyr::ungroup()
+
+test_df |>
+  dplyr::select(race_id, horse_id, winning_prob) |>
+  dplyr::arrange(race_id) |>
+  head()
+```
+
+### Brier score evaluation
+
+I compute the Brier score of this model and compare it to a naive baseline where each horse gets probability \(1 / n_{	ext{runners}}\).
+
+```{r}
+brier_model <- mean((test_df$winning_prob - test_df$obs__is_winner)^2)
+
+baseline_brier <- test_df |>
+  dplyr::mutate(
+    p_baseline = 1 / n_runners
+  ) |>
+  dplyr::summarise(
+    brier = mean((p_baseline - obs__is_winner)^2)
+  ) |>
+  dplyr::pull(brier)
+
+c(brier_model = brier_model, brier_baseline = baseline_brier)
+```
+
+### Feature importance
+
+To give some notion of **feature importance**, I look at the absolute z-statistics from the logistic regression, which reflect how strongly each term is associated with the outcome (conditional on the others).
+
+```{r}
+coef_table <- broom::tidy(win_model_ns) |>
+  dplyr::arrange(desc(abs(statistic)))
+
+head(coef_table, 20)
+```
+
+This highlights which variables (and which spline terms / categories) are most influential in the model (e.g. horse rating terms, specific race types, or going categories).
+
+**Summary (Q3):**
+
+- I use a logistic regression with spline terms on key continuous variables and ratings from Q2.
+- To better respect race structure, I transform the linear predictors to race-wise probabilities via a softmax so that they sum to 1 within each race.
+- The model achieves a lower Brier score than the naive equal-chance baseline.
+- I report feature importance via the absolute z-statistics and could extend this with grouped feature importance (e.g. dropping all terms for a feature and measuring deviance/Brier change).
+- A more principled race-level model (e.g. Plackett–Luce or a conditional logit estimated at the race level) could further improve the treatment of competition, but this would require a different likelihood.
+
+---
+
+## Q4. Compare to the Betting Market
+
+In this section I compare the predictive model to the betting market and define a simple value-betting strategy using the **Betfair Starting Price** (`obs__bsp`).
+
+### Market and model probabilities
+
+For each runner in the test set with a valid BSP:
+
+- Model probability: `p_model` = race-wise `winning_prob` from Q3.
+- Market probability: \( p_{	ext{market}} = 1 / 	ext{BSP} \) (approximate implied probability).
+- True outcome: `obs__is_winner`.
+
+```{r}
+test_df_bets <- test_df |>
+  dplyr::filter(!is.na(obs__bsp)) |>
+  dplyr::mutate(
+    p_model  = winning_prob,
+    p_market = 1 / obs__bsp
+  )
+
+test_df_bets |>
+  dplyr::select(race_id, horse_id, p_model, p_market, obs__Place) |>
+  dplyr::arrange(race_id) |>
+  head()
+```
+
+### Brier score comparison: model vs BSP vs naive
+
+```{r}
+brier_overall <- test_df_bets |>
+  dplyr::summarise(
+    n_runners   = dplyr::n(),
+    brier_model = mean((p_model  - obs__is_winner)^2),
+    brier_bsp   = mean((p_market - obs__is_winner)^2),
+    brier_naive = mean(((1 / n_runners) - obs__is_winner)^2)
+  )
+
+brier_overall
+```
+
+I also compute the **average difference** in Brier scores per runner and a **confidence interval**:
+
+\[
+\Delta = (p_{	ext{BSP}} - y)^2 - (p_{	ext{model}} - y)^2.
+\]
+
+Positive \(\Delta\) means the model is better (lower Brier).
+
+```{r}
+brier_diff <- test_df_bets |>
+  dplyr::mutate(
+    diff = (p_market - obs__is_winner)^2 - (p_model - obs__is_winner)^2
+  )
+
+mean_diff <- mean(brier_diff$diff)
+sd_diff   <- sd(brier_diff$diff)
+n_obs     <- nrow(brier_diff)
+se_diff   <- sd_diff / sqrt(n_obs)
+ci_low    <- mean_diff - 1.96 * se_diff
+ci_high   <- mean_diff + 1.96 * se_diff
+
+c(mean_diff = mean_diff, ci_low = ci_low, ci_high = ci_high)
+```
+
+This quantifies whether the difference in Brier scores between the model and BSP is statistically meaningful.
+
+### Subset analysis with larger bins and CIs
+
+Instead of very granular bins (e.g. by race_id), which produce tiny and noisy subsets, I look at **coarser groupings**:
+
+- `race_type_simple`
+- field size bands (≤8, 9–12, 13+ runners)
+
+I retain only subsets with enough runners (e.g. ≥ 200) and compute Brier differences and CIs within each.
+
+```{r}
+test_df_bets <- test_df_bets |>
+  dplyr::mutate(
+    field_band = dplyr::case_when(
+      n_runners <= 8  ~ "≤8",
+      n_runners <= 12 ~ "9–12",
+      TRUE            ~ "13+"
+    )
+  )
+
+summarise_brier_by <- function(data, group_var, min_n = 200) {
+  data |>
+    dplyr::group_by(.data[[group_var]]) |>
+    dplyr::summarise(
+      n_runners   = dplyr::n(),
+      brier_model = mean((p_model  - obs__is_winner)^2),
+      brier_bsp   = mean((p_market - obs__is_winner)^2),
+      diff        = brier_bsp - brier_model,
+      sd_diff     = sd((p_market - obs__is_winner)^2 - (p_model - obs__is_winner)^2),
+      se_diff     = sd_diff / sqrt(n_runners),
+      ci_low      = diff - 1.96 * se_diff,
+      ci_high     = diff + 1.96 * se_diff,
+      .groups     = "drop"
+    ) |>
+    dplyr::filter(n_runners >= min_n)
+}
+
+brier_by_type  <- summarise_brier_by(test_df_bets, "race_type_simple", min_n = 200)
+brier_by_field <- summarise_brier_by(test_df_bets, "field_band", min_n = 200)
+
+brier_by_type
+brier_by_field
+```
+
+These tables show where (if anywhere) the model systematically outperforms BSP (positive `diff` and CI excluding zero) or vice versa, while respecting sample-size considerations.
+
+### Edge and value-betting strategy
+
+In betting, the **edge** is typically defined as the expected return per unit stake:
+
+\[
+	ext{edge} = p_{	ext{model}} 	imes 	ext{odds} - 1,
+\]
+
+where `odds` is the decimal BSP. If edge > 0, the bet has positive expected value according to the model.
+
+```{r}
+edge_threshold <- params$edge_threshold  # e.g. 0.05
+
+edge_threshold
+```
+
+Then I construct a simple strategy: **bet 1 unit** whenever `edge > edge_threshold`.
+
+```{r}
+bet_df <- test_df_bets |>
+  dplyr::mutate(
+    odds = obs__bsp,
+    edge = p_model * odds - 1,  # expected return per unit stake
+    bet  = edge > edge_threshold,
+    ret  = dplyr::case_when(
+      bet & obs__is_winner == 1 ~ (odds - 1),  # net profit on win
+      bet & obs__is_winner == 0 ~ -1,          # lose stake
+      TRUE                      ~ 0
+    )
+  ) |>
+  dplyr::filter(bet)
+
+n_bets   <- nrow(bet_df)
+total_ret <- sum(bet_df$ret)
+roi       <- ifelse(n_bets > 0, total_ret / n_bets, NA_real_)
+
+sd_ret <- sd(bet_df$ret)
+se_ret <- sd_ret / sqrt(n_bets)
+ci_low  <- roi - 1.96 * se_ret
+ci_high <- roi + 1.96 * se_ret
+
+c(n_bets = n_bets, roi = roi, ci_low = ci_low, ci_high = ci_high)
+```
+
+**Summary (Q4):**
+
+- I compare the model to BSP using Brier scores and a CI for the difference.
+- I examine subsets with **sufficient sample size**, computing Brier differences and confidence intervals, rather than relying on tiny, noisy bins.
+- I use a standard **edge definition**: `edge = p_model * BSP - 1`.
+- For a given edge threshold (here explicitly `edge_threshold = ` `r params$edge_threshold`), I compute the number of bets, ROI, and a confidence interval for the ROI.
+- In this dataset, the simple strategy based on the current model does **not** achieve a statistically significant positive ROI, and BSP remains a very strong benchmark, which is consistent with market efficiency.
