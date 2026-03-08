@@ -3,24 +3,21 @@ title: "Horse Racing - Sport Betting Modelling"
 author: "Xihang Chen"
 date: today
 format:
-  html:
+  pdf:
     toc: true
     toc-depth: 3
     number-sections: true
     theme: cosmo
-    code-fold: true
 execute:
-  echo: true
+  echo: false
   warning: false
   message: false
   cache: false
 params:
-  seed: 42
-  edge_threshold: 0.05
+  seed: 123
+  edge: 0.01
   data_path: "input/horse_racing_dataset.xlsx"
 ---
-
-## Set up
 
 ```{r}
 set.seed(params$seed)
@@ -42,13 +39,11 @@ df <- readxl::read_excel(params$data_path)
 ```
 
 ## Overall summary
-This project develops a race-level win probability model for horse racing using a conditional logit framework that accounts for the competitive structure within each race. The model incorporates performance ratings for horses, jockeys, and trainers, alongside race-level features (distance, going, field size, race type), and tests whether these variables improve prediction after accounting for `ltp_5min`. Performance is evaluated out-of-sample using probabilistic metrics (log loss, Brier score, calibration) and simulated betting returns with confidence intervals, with a focus on economically meaningful residual edge.
+This project develops a race-level win probability model for horse racing using a conditional logit framework that accounts for the competitive structure within each race. The model incorporates performance ratings for horses, jockeys, and trainers, alongside runner-level characteristics (age, weight) and engineered performance ratings, and tests whether these variables improve prediction after accounting for `ltp_5min`. Performance is evaluated out-of-sample using probabilistic metrics (log loss, Brier score, calibration) and simulated betting returns with confidence intervals, with a focus on economically meaningful residual edge.
 
 ## Data Exploration
-The dataframe consists of following columns:
-```{r}
-colnames(df)
-```
+The dataset consists of runner-level observations with race identifiers, pre-race characteristics, market prices, and realised outcomes.
+
 Upon inspection, `obs_completion_time` is missing primarily for non-completions (UR, PU, BD, etc.), with `obs_racing_post_rating` (RPR) following the same pattern. Missingness is therefore outcome-dependent rather than random, reflecting structural censoring. These variables are excluded from predictive modelling to avoid leakage and bias.
 
 ## Implementation of Rating Systems
@@ -70,25 +65,25 @@ df <- df |>
   )
 ```
 
-Mathematically speaking, this rating system is done via $$R_e(t) =
-\frac{W_e(t)}{W_e(t) + k}
-\cdot
-\bar{r}_e^{(\text{decay})}(t)
-+\frac{k}{W_e(t) + k}\mu$$
-where $$\bar{r}_e^{(\text{decay})}(t)
-=
-\frac{\sum_{i: t_i < t} \exp(-\lambda (t - t_i)) r_{e,i}}
-{\sum_{i: t_i < t} \exp(-\lambda (t - t_i))}$$
-is the time-decayed rating and associated terms are defined as follows:
+<!-- Mathematically speaking, this rating system is done via $$R_e(t) = -->
+<!-- \frac{W_e(t)}{W_e(t) + k} -->
+<!-- \cdot -->
+<!-- \bar{r}_e^{(\text{decay})}(t) -->
+<!-- +\frac{k}{W_e(t) + k}\mu$$ -->
+<!-- where $$\bar{r}_e^{(\text{decay})}(t) -->
+<!-- = -->
+<!-- \frac{\sum_{i: t_i < t} \exp(-\lambda (t - t_i)) r_{e,i}} -->
+<!-- {\sum_{i: t_i < t} \exp(-\lambda (t - t_i))}$$ -->
+<!-- is the time-decayed rating and associated terms are defined as follows: -->
 
-- $R_e(t)$ is the rating of entity $e$ (horse, jockey, or trainer) at time $t$.
-- $r_{e,i}$ is the observed rating from past run $i$ of entity $e$.
-- $t_i$ is the date of past run $i$, and $t$ is the current race date.
-- $\bar{r}_e^{(\text{decay})}(t)$ is the exponentially time-decayed weighted mean of prior performances.
-- $W_e(t) = \sum_{i: t_i < t} \exp(-\lambda (t - t_i))$ is the effective sample size (total decayed weight).
-- $\mu$ is the global mean rating across all entities.
-- $k$ is the shrinkage parameter controlling the strength of pull toward the global mean.
-- $\lambda = \frac{\ln(2)}{h}$ is the decay parameter, where $h$ is the half-life in days, corresponding to `half_life_days` in the function.
+<!-- - $R_e(t)$ is the rating of entity $e$ (horse, jockey, or trainer) at time $t$. -->
+<!-- - $r_{e,i}$ is the observed rating from past run $i$ of entity $e$. -->
+<!-- - $t_i$ is the date of past run $i$, and $t$ is the current race date. -->
+<!-- - $\bar{r}_e^{(\text{decay})}(t)$ is the exponentially time-decayed weighted mean of prior performances. -->
+<!-- - $W_e(t) = \sum_{i: t_i < t} \exp(-\lambda (t - t_i))$ is the effective sample size (total decayed weight). -->
+<!-- - $\mu$ is the global mean rating across all entities. -->
+<!-- - $k$ is the shrinkage parameter controlling the strength of pull toward the global mean. -->
+<!-- - $\lambda = \frac{\ln(2)}{h}$ is the decay parameter, where $h$ is the half-life in days, corresponding to `half_life_days` in the function. -->
 
 For illustration, here is an evolution graph of this rating system for the horse with `horse_id = 1`.
 
@@ -116,7 +111,7 @@ ggplot(horse_data, aes(x = date)) +
 
  
 ## Building Models
-Conditional logistic regression `survival::clogit` is used, with `strata(race_id)`, so that probabilities are estimated conditional on each race, enforcing the one-winner-per-race constraint. Linear predictors are converted to race-level probabilities using a softmax transformation so that predicted probabilities sum to one within each race.
+Conditional logistic regression `survival::clogit` is used, with `strata(race_id)`, so that probabilities are estimated conditional on each race, enforcing the one-winner-per-race constraint. Race-level constants (e.g., distance or going) are not included, as conditional likelihood identifies only within-race variation. Linear predictors are converted to race-level probabilities using a softmax transformation so that predicted probabilities sum to one within each race.
 
 There are three models to estimate win probabilities:
 
@@ -170,16 +165,14 @@ model_m0 <- clogit(obs_is_winner ~ logit_market + strata(race_id), data = train_
 
 model_m1 <- clogit(obs_is_winner ~ 
                      horse_rating + jockey_rating + trainer_rating +
-                     ns(age,3) + ns(carried_weight,3) + ns(race_distance,3) +
-                     race_type_simple + going_clean + n_runners +
+                     ns(age,3) + ns(carried_weight,3) +
                      strata(race_id),
                    data = train_df)
 
 model_m2 <- clogit(obs_is_winner ~ 
                      logit_market +
                      horse_rating + jockey_rating + trainer_rating +
-                     ns(age,3) + ns(carried_weight,3) + ns(race_distance,3) +
-                     race_type_simple + going_clean + n_runners +
+                     ns(age,3) + ns(carried_weight,3) +
                      strata(race_id),
                    data = train_df)
 
@@ -188,22 +181,22 @@ beta_m1 <- coef(model_m1)
 beta_m2 <- coef(model_m2)
 
 X_m0 <- model.matrix(~ logit_market - 1, data = test_df)
+X_m0 <- X_m0[, names(beta_m0), drop = FALSE]
+lp_m0 <- as.vector(X_m0 %*% beta_m0)
 
 X_m1 <- model.matrix(~ horse_rating + jockey_rating + trainer_rating +
-                       ns(age,3) + ns(carried_weight,3) + ns(race_distance,3) +
-                       race_type_simple + going_clean + n_runners - 1,
+                       ns(age,3) + ns(carried_weight,3) - 1,
                      data = test_df)
+X_m1 <- X_m1[, names(beta_m1), drop = FALSE]
+lp_m1 <- as.vector(X_m1 %*% beta_m1)
 
 X_m2 <- model.matrix(~ logit_market + horse_rating + jockey_rating + trainer_rating +
-                       ns(age,3) + ns(carried_weight,3) + ns(race_distance,3) +
-                       race_type_simple + going_clean + n_runners - 1,
+                       ns(age,3) + ns(carried_weight,3)  - 1,
                      data = test_df)
-
-lp_m0 <- as.vector(X_m0 %*% beta_m0)
-lp_m1 <- as.vector(X_m1 %*% beta_m1)
+X_m2 <- X_m2[, names(beta_m2), drop = FALSE]
 lp_m2 <- as.vector(X_m2 %*% beta_m2)
 
-test_df <- test_df %>%
+test_df <- test_df |>
   mutate(
     p_m0 = lp_m0,
     p_m1 = lp_m1,
@@ -212,12 +205,12 @@ test_df <- test_df %>%
 test_df <- test_df |>
   group_by(race_id) |>
   mutate(
-    p_m0 = exp(p_m0 - max(p_m0, na.rm = TRUE)),
-    p_m0 = p_m0 / sum(p_m0, na.rm = TRUE),
-    p_m1 = exp(p_m1 - max(p_m1, na.rm = TRUE)),
-    p_m1 = p_m1 / sum(p_m1, na.rm = TRUE),
-    p_m2 = exp(p_m2 - max(p_m2, na.rm = TRUE)),
-    p_m2 = p_m2 / sum(p_m2, na.rm = TRUE)
+    p_m0 = exp(p_m0 - max(p_m0)),
+    p_m0 = p_m0 / sum(p_m0),
+    p_m1 = exp(p_m1 - max(p_m1)),
+    p_m1 = p_m1 / sum(p_m1),
+    p_m2 = exp(p_m2 - max(p_m2)),
+    p_m2 = p_m2 / sum(p_m2)
   ) |>
   ungroup()
 
@@ -233,8 +226,75 @@ results <- tibble(
     brier(test_df$p_m1, test_df$obs_is_winner),
     brier(test_df$p_m2, test_df$obs_is_winner)
   )
+) |>
+  mutate(
+    LogLoss = signif(LogLoss, 5),
+    Brier   = signif(Brier, 5)
+  )
+
+knitr::kable(results, digits = 5, align = "lcc")
+
+ll_m0 <- -(test_df$obs_is_winner * log(test_df$p_m0) +
+           (1 - test_df$obs_is_winner) * log(1 - test_df$p_m0))
+
+ll_m2 <- -(test_df$obs_is_winner * log(test_df$p_m2) +
+           (1 - test_df$obs_is_winner) * log(1 - test_df$p_m2))
+
+diff <- ll_m0 - ll_m2
+
+mean_diff <- mean(diff)
+se_diff <- sd(diff) / sqrt(length(diff))
+
+ci <- tibble(
+  Mean_LogLoss_Improvement = signif(mean_diff, 5),
+  CI_Low = signif(mean_diff - 1.96 * se_diff, 5),
+  CI_High = signif(mean_diff + 1.96 * se_diff, 5)
 )
 
-results
+knitr::kable(ci, digits = 8, align = "lcc")
+
+knitr::kable(
+  tidy(model_m2) |>
+    filter(term != "strata(race_id)") |>
+    mutate(
+      estimate = signif(estimate, 4),
+      std.error = signif(std.error, 4),
+      statistic = signif(statistic, 4),
+      p.value = signif(p.value, 4)
+    ),
+  align = "lcccc"
+)
 ```
-The closing market is highly efficient. After conditioning on `ltp_5min`, horse-level time-decayed ratings retain statistically significant incremental explanatory power, though the economic magnitude is small and not statistically distinguishable from zero in this sample.
+The pre-off market is highly efficient, with the estimated coefficient on market log-odds close to one. Time-decayed horse-level ratings provide a small but statistically significant incremental improvement in predictive accuracy within races. While the economic magnitude of the gain is modest, the improvement is consistently positive out-of-sample.
+
+## Trading Strategy 
+
+To evaluate economic significance, model-implied probabilities are compared to pre-off market odds and implemented in a simple threshold-based value betting strategy.
+
+```{r}
+trade_df <- test_df |>
+  mutate(
+    edge = p_m2 * ltp_5min - 1,
+    bet = edge > params$edge,
+    ret = if_else(
+      bet & obs_is_winner == 1, ltp_5min - 1,
+      if_else(bet & obs_is_winner == 0, -1, 0)
+    )
+  )
+
+returns <- tibble(
+  Bets = sum(trade_df$bet),
+  ROI = mean(trade_df$ret[trade_df$bet], na.rm = TRUE),
+  HitRate = mean(trade_df$obs_is_winner[trade_df$bet], na.rm = TRUE)
+)
+
+knitr::kable(returns, digits = 5)
+```
+
+At a 1% edge threshold, the realised ROI is negative out-of-sample, indicating that while the model improves probability calibration, the residual mispricing relative to the 5-minute pre-off market is not sufficient to generate robust economic profit under this simple execution rule.
+
+## Conclusion
+
+While the improvement in log loss is statistically significant, its magnitude is economically small, highlighting the distinction between probabilistic calibration gains and tradable market inefficiencies.
+
+The model relies solely on publicly available runner-level features and a static pre-off market snapshot. Further economic gains would likely require modelling price dynamics, liquidity, or additional proprietary performance signals.
